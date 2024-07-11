@@ -131,7 +131,7 @@ from time import time as ttime
 import torch
 import librosa
 import soundfile as sf
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Body
 from fastapi.responses import StreamingResponse, JSONResponse
 import uvicorn
 from transformers import AutoModelForMaskedLM, AutoTokenizer
@@ -147,6 +147,12 @@ from tools.my_utils import load_audio
 import config as global_config
 import logging
 import subprocess
+from tools.asr import funasr_asr 
+import soundfile
+from datetime import datetime
+import uuid
+from pypinyin import pinyin, Style
+from pydantic import BaseModel
 
 
 class DefaultRefer:
@@ -194,6 +200,28 @@ def change_sovits_weights(sovits_path):
         vq_model = vq_model.to(device)
     vq_model.eval()
     vq_model.load_state_dict(dict_s2["weight"], strict=False)
+    
+def change_sovits_weights_v2(sovits_path):
+    dict_s2 = torch.load(sovits_path, map_location="cpu")
+    hps = dict_s2["config"]
+    hps = DictToAttrRecursive(hps)
+    hps.model.semantic_frame_rate = "25hz"
+    model_params_dict = vars(hps.model)
+    vq_model = SynthesizerTrn(
+        hps.data.filter_length // 2 + 1,
+        hps.train.segment_size // hps.data.hop_length,
+        n_speakers=hps.data.n_speakers,
+        **model_params_dict
+    )
+    if ("pretrained" not in sovits_path):
+        del vq_model.enc_q
+    if is_half == True:
+        vq_model = vq_model.half().to(device)
+    else:
+        vq_model = vq_model.to(device)
+    vq_model.eval()
+    vq_model.load_state_dict(dict_s2["weight"], strict=False)
+    return vq_model, hps
 
 
 def change_gpt_weights(gpt_path):
@@ -210,6 +238,21 @@ def change_gpt_weights(gpt_path):
     t2s_model.eval()
     total = sum([param.nelement() for param in t2s_model.parameters()])
     logger.info("Number of parameter: %.2fM" % (total / 1e6))
+
+def change_gpt_weights_v2(gpt_path):
+    hz = 50
+    dict_s1 = torch.load(gpt_path, map_location="cpu")
+    config = dict_s1["config"]
+    max_sec = config["data"]["max_sec"]
+    t2s_model = Text2SemanticLightningModule(config, "****", is_train=False)
+    t2s_model.load_state_dict(dict_s1["weight"])
+    if is_half == True:
+        t2s_model = t2s_model.half()
+    t2s_model = t2s_model.to(device)
+    t2s_model.eval()
+    total = sum([param.nelement() for param in t2s_model.parameters()])
+    logger.info("Number of parameter: %.2fM" % (total / 1e6))
+    return hz, max_sec, t2s_model, config
 
 
 def get_bert_feature(text, word2ph):
@@ -423,8 +466,10 @@ def read_clean_buffer(audio_bytes):
 
     return audio_bytes, audio_chunk
 
+splits = {",", ".", ";", "?", "!", "、", "，", "。", "？", "！", "；", "：", "…"}
 
 def cut_text(text, punc):
+    # TODO 按英文句号切分时，需要考虑小数点的情况
     punc_list = [p for p in punc if p in {",", ".", ";", "?", "!", "、", "，", "。", "？", "！", "；", "：", "…"}]
     if len(punc_list) > 0:
         punds = r"[" + "".join(punc_list) + r"]"
@@ -522,6 +567,158 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language)
         if media_type == "wav":
             audio_bytes = pack_wav(audio_bytes,hps.data.sampling_rate)
         yield audio_bytes.getvalue()
+        
+def remove_special_characters(text):
+    return re.sub(r'[^\w\s]', '', text)
+
+# 转换为因素，并且不带音调，考虑多音字
+def convert_to_pinyin(chinese_text):
+    return pinyin(chinese_text, style=Style.NORMAL, heteronym=True)
+
+def check_text(text1, text2):
+    if len(text1) != len(text2):
+        print("失败 重推 ------------------------>")
+        return False
+    else:
+        for i in range(len(text1)):
+            if not bool(
+                set(convert_to_pinyin(text1[i])[0]) &
+                set(convert_to_pinyin(text2[i])[0])
+            ):
+                print(text1[i], text2[i])
+                return False
+    return True        
+        
+def get_tts_wav_v2(hps, t2s_model, vq_model,config,hz,max_sec, ref_wav_path, prompt_text, prompt_language, text, text_language, output_path):
+    t0 = ttime()
+    
+    unique_id = uuid.uuid4()
+    now = datetime.now()
+    # 格式化时间为 YYYYmmddHHMMSS
+    formatted_time = now.strftime("%Y%M%d%H%m%s")
+    temp_dir = os.path.join("output", "tmp", f"{formatted_time}-{unique_id}")
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    prompt_text = prompt_text.strip("\n")
+    prompt_language, text = prompt_language, text.strip("\n")
+    zero_wav = np.zeros(int(hps.data.sampling_rate * 0.3), dtype=np.float16 if is_half == True else np.float32)
+    with torch.no_grad():
+        wav16k, sr = librosa.load(ref_wav_path, sr=16000)
+        wav16k = torch.from_numpy(wav16k)
+        zero_wav_torch = torch.from_numpy(zero_wav)
+        if (is_half == True):
+            wav16k = wav16k.half().to(device)
+            zero_wav_torch = zero_wav_torch.half().to(device)
+        else:
+            wav16k = wav16k.to(device)
+            zero_wav_torch = zero_wav_torch.to(device)
+        wav16k = torch.cat([wav16k, zero_wav_torch])
+        ssl_content = ssl_model.model(wav16k.unsqueeze(0))["last_hidden_state"].transpose(1, 2)  # .float()
+        codes = vq_model.extract_latent(ssl_content)
+        prompt_semantic = codes[0, 0]
+    t1 = ttime()
+    prompt_language = dict_language[prompt_language.lower()]
+    text_language = dict_language[text_language.lower()]
+    phones1, bert1, norm_text1 = get_phones_and_bert(prompt_text, prompt_language)
+    texts = text.split("\n")
+    audio_bytes = BytesIO()
+
+    print(f"\noutput_path ---> {output_path}\nstream_mode ---> {stream_mode}\n")
+    
+    audio_opt = []
+    for text in texts:
+        # 简单防止纯符号引发参考音频泄露
+        if only_punc(text):
+            continue
+        
+        # 解决输入目标文本的空行导致报错的问题
+        if (len(text.strip()) == 0):
+            continue
+        
+        if (text[-1] not in splits): text += "。" if text_language != "en" else "."
+        def _infer():
+            phones2, bert2, norm_text2 = get_phones_and_bert(text, text_language)
+            # TODO 接口不支持 无参考模式
+            bert = torch.cat([bert1, bert2], 1)
+            all_phoneme_ids = torch.LongTensor(phones1 + phones2).to(device).unsqueeze(0)
+            bert = bert.to(device).unsqueeze(0)
+            all_phoneme_len = torch.tensor([all_phoneme_ids.shape[-1]]).to(device)
+            prompt = prompt_semantic.unsqueeze(0).to(device)
+            t2 = ttime()
+            with torch.no_grad():
+                # pred_semantic = t2s_model.model.infer(
+                pred_semantic, idx = t2s_model.model.infer_panel(
+                    all_phoneme_ids,
+                    all_phoneme_len,
+                    prompt,
+                    bert,
+                    # prompt_phone_len=ph_offset,
+                    top_k=config['inference']['top_k'],
+                    early_stop_num=hz * max_sec)
+            t3 = ttime()
+            # print(pred_semantic.shape,idx)
+            pred_semantic = pred_semantic[:, -idx:].unsqueeze(0)  # .unsqueeze(0)#mq要多unsqueeze一次
+            refer = get_spepc(hps, ref_wav_path)  # .to(device)
+            if (is_half == True):
+                refer = refer.half().to(device)
+            else:
+                refer = refer.to(device)
+            # audio = vq_model.decode(pred_semantic, all_phoneme_ids, refer).detach().cpu().numpy()[0, 0]
+            audio = \
+                vq_model.decode(pred_semantic, torch.LongTensor(phones2).to(device).unsqueeze(0),
+                            refer).detach().cpu().numpy()[
+                0, 0]  ###试试重建不带上prompt部分
+                            
+            max_audio=np.abs(audio).max()#简单防止16bit爆音
+            if max_audio>1:audio/=max_audio
+            temp_audio_path = os.path.join(temp_dir, f"{len(audio_opt)}.wav")
+            soundfile.write(
+                temp_audio_path,
+                (audio * 32768).astype(np.int16),
+                hps.data.sampling_rate,
+            )
+            
+            infer_text = funasr_asr.only_asr(temp_audio_path)
+            print("反推文本 ======> ", infer_text)
+            rm_infer_text = remove_special_characters(infer_text) 
+            rm_text = remove_special_characters(norm_text2) 
+            print("rm_infer_text", rm_infer_text)
+            print("rm_text", rm_text)
+            processed = check_text(rm_infer_text, rm_text)
+            return processed, audio
+        
+        ok = False
+        infer_count = 0
+        while not ok:
+            ok, audio = _infer()
+            # if not infer_check:
+            #     break
+            if infer_count == 10:
+                print('--重试超过10次')
+                # text = remove_special_characters(text)
+            # TODO 切换gpt模型
+            # TODO 切换参考音频
+            infer_count = infer_count + 1
+            if infer_count > 15:
+                break
+                # TODO 暂时返回
+                # raise "推理失败"
+        audio_opt.append(audio)
+        audio_opt.append(zero_wav)
+    
+    try:
+        soundfile.write(
+            output_path,
+            (np.concatenate(audio_opt, 0) * 32768).astype(np.int16),
+            hps.data.sampling_rate,
+        )
+    except Exception as e:
+        return HTTPException(
+            status_code=500, detail="error"
+        )
+        
+    return output_path
+    
 
 
 
@@ -552,6 +749,14 @@ def handle_change(path, text, language):
 
     return JSONResponse({"code": 0, "message": "Success"}, status_code=200)
 
+
+def handel_v2(sovits_model_path, gpt_model_path, refer_wav_path, prompt_text, prompt_language, text,text_language="zh", cut_punc="。？！；", output_path=""):
+    vq_model, hps = change_sovits_weights_v2(sovits_model_path)
+    hz, max_sec, t2s_model, config = change_gpt_weights_v2(gpt_model_path)
+    
+    text = cut_text(text,cut_punc)
+    return get_tts_wav_v2(hps, t2s_model, vq_model, config,hz,max_sec,refer_wav_path, prompt_text, prompt_language, text, text_language, output_path)
+    
 
 def handle(refer_wav_path, prompt_text, prompt_language, text, text_language, cut_punc):
     if (
@@ -627,7 +832,8 @@ parser.add_argument("-b", "--bert_path", type=str, default=g_config.bert_path, h
 args = parser.parse_args()
 sovits_path = args.sovits_path
 gpt_path = args.gpt_path
-device = args.device
+# device = args.device
+device = "cuda"
 port = args.port
 host = args.bind_addr
 cnhubert_base_path = args.hubert_path
@@ -691,8 +897,8 @@ if is_half:
 else:
     bert_model = bert_model.to(device)
     ssl_model = ssl_model.to(device)
-change_sovits_weights(sovits_path)
-change_gpt_weights(gpt_path)
+# change_sovits_weights(sovits_path)
+# change_gpt_weights(gpt_path)
 
 
 
@@ -769,6 +975,96 @@ async def tts_endpoint(
 ):
     return handle(refer_wav_path, prompt_text, prompt_language, text, text_language, cut_punc)
 
+def sort_strings_by_last_number(strings, reverse=True):
+    def sort_key(s):
+        numeric_part = s.split('-e')[-1]
+        if numeric_part.isdigit():
+            return int(numeric_part)
+        return float('inf')
+
+    sorted_strings = sorted(strings, key=sort_key, reverse=reverse)
+    return sorted_strings
+
+def sorted_file_name(dir: str, ext: str, reverse: bool = False, index = 0):
+    try:
+        # 获取目录下所有文件和文件夹
+        all_files = os.listdir(dir)
+        # 筛选出以.ckpt结尾的文件
+        files = [f for f in all_files if f.endswith(ext)]
+        
+        # 按名称逆序排序
+        sorted_files = sort_strings_by_last_number(files, reverse=reverse)
+        # 打印结果
+        
+        print(sorted_files)
+        return dir + "/" + sorted_files[index]
+    except Exception as e:
+        print(f"error {e}")
+        return ""
+
+def read_file(file_path: str):
+    with open(file_path, 'r', encoding='utf-8') as file:
+        content = file.read()
+        return content    
+
+class TTSInferRequest(BaseModel):
+    text: str
+    model_name: str
+    output_path: str
+
+@app.post("/infer")
+async def tts_infer(
+    body: TTSInferRequest = Body(...),
+):
+    model_name = body.model_name
+    text = body.text
+    output_path = body.output_path
+    
+    if model_name == "" or text == "" or  output_path == "":
+        return JSONResponse({ "message": "缺少参数"}, status_code=400)
+    
+    print(
+        model_name,
+        output_path,
+        text,
+    )
+    text = re.sub(r'[a-zA-Z]', '', text)
+    
+    model_dir = os.path.join("mercury_workspace", model_name)
+    if not os.path.exists(model_dir):
+        return JSONResponse({ "message": "audio model v2 not exists"}, status_code=400)
+    
+    # 获取 模型 和 参考音频信息
+    gpt_dir = os.path.join(model_dir, "GPT_weights")
+    sovits_dir = os.path.join(model_dir, "SoVITS_weights")
+    ref_dir = os.path.join(model_dir, "reference")
+    
+    gpt_model_path = sorted_file_name(gpt_dir, ".ckpt")
+    sovits_model_path = sorted_file_name(sovits_dir, ".pth")
+    refer_wav_path = sorted_file_name(ref_dir, '.wav') # TODO reference 的参考音频进行评估打分，仅保留只有中文或英文的参考，参考语言根据文本推断
+    refer_lab_path = sorted_file_name(ref_dir, '.lab') # TODO 根据参考音频的名称选取
+    prompt_text = read_file(refer_lab_path)
+    prompt_language = "zh"
+    print("\n ------------------------------------------------------------------")
+    print("gpt_model_path", gpt_model_path)
+    print("sovits_model_path", sovits_model_path)
+    print("refer_wav_path", refer_wav_path)
+    print("prompt_text",prompt_text)
+    print("---------------------------------------------------------------------\n")
+    if gpt_model_path == '' or sovits_model_path == '' or refer_wav_path == '' or refer_lab_path == '' or prompt_text == '':
+        return JSONResponse({ "message": f"缺少{model_name}模型文件"}, status_code=400)
+    
+    # TODO 过滤掉英文，
+    # TODO 将非小数点时的英文句号替换成中文
+    return handel_v2(
+        sovits_model_path = sovits_model_path, 
+        gpt_model_path = gpt_model_path, 
+        refer_wav_path = refer_wav_path, 
+        prompt_text = prompt_text, 
+        prompt_language = prompt_language,
+        text = text,
+        output_path = output_path,
+    )
 
 if __name__ == "__main__":
     uvicorn.run(app, host=host, port=port, workers=1)

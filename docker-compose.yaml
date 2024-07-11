@@ -12,6 +12,11 @@ services:
       - ./logs:/workspace/logs
       - ./SoVITS_weights:/workspace/SoVITS_weights
       - ./reference:/workspace/reference
+      - ./GPT_weights:/workspace/GPT_weights
+      - ./GPT_SoVITS/inference_webui.py:/workspace/GPT_SoVITS/inference_webui.py
+      - ./api.py:/workspace/api.py
+      - /data:/data
+      - ./mercury_workspace:/workspace/mercury_workspace
     working_dir: /workspace
     ports:
       - "9880:9880"
@@ -30,3 +35,5 @@ services:
     stdin_open: true
     tty: true
     restart: unless-stopped
+    command: ["sh", "-c", "python webui.py & python api.py"]
+    # command: ["sh", "-c", "python api.py"]

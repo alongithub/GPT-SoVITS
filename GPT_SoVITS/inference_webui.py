@@ -17,6 +17,26 @@ logging.getLogger("charset_normalizer").setLevel(logging.ERROR)
 logging.getLogger("torchaudio._extension").setLevel(logging.ERROR)
 import pdb
 import torch
+from tools.asr import funasr_asr 
+import soundfile
+from datetime import datetime
+import uuid
+from pypinyin import pinyin, Style
+# import whisper
+# model = whisper.load_model("medium")  
+# import librosa
+# y, sr = librosa.load('output/slice_opt/chenxiaobing_long7min/long7min.wav_0000012800_0000148800.wav', sr=None)
+
+# t = funasr_asr.only_asr("/workspace/output/slice_opt/chenxiaobing_long7min/long7min.wav_0000012800_0000148800.wav'")
+# print('--')
+
+# print('t', t)
+
+# raise
+
+
+
+
 
 if os.path.exists("./gweight.txt"):
     with open("./gweight.txt", 'r', encoding="utf-8") as file:
@@ -65,10 +85,10 @@ from text import cleaned_text_to_sequence
 from text.cleaner import clean_text
 from time import time as ttime
 from module.mel_processing import spectrogram_torch
-from tools.my_utils import load_audio
+from my_utils import load_audio
 from tools.i18n.i18n import I18nAuto
 
-i18n = I18nAuto()
+i18n = I18nAuto("zh_CN")
 
 # os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'  # 确保直接启动推理UI时也能够设置。
 
@@ -84,6 +104,22 @@ if is_half == True:
 else:
     bert_model = bert_model.to(device)
 
+sampling_rate = 16000
+audio_slice = []
+audios = []
+btns = []
+
+def gen_audio(index):
+    return gr.Audio(label=f"audio {index + 1}")
+
+def gen_btn(index):
+    cindex = index
+    btn = gr.Button(f"re infer audio{cindex + 1}")
+    btn.click(
+        fn=lambda: refresh_slice(cindex),
+        outputs=[audios[cindex]]
+    )
+    return btn
 
 def get_bert_feature(text, word2ph):
     with torch.no_grad():
@@ -312,10 +348,33 @@ def merge_short_text_in_array(texts, threshold):
             result[len(result) - 1] += text
     return result
 
-def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language, how_to_cut=i18n("不切"), top_k=20, top_p=0.6, temperature=0.6, ref_free = False):
+def remove_special_characters(text):
+    return re.sub(r'[^\w\s]', '', text)
+
+# 转换为因素，并且不带音调，考虑多音字
+def convert_to_pinyin(chinese_text):
+    return pinyin(chinese_text, style=Style.NORMAL, heteronym=True)
+
+def check_text(text1, text2):
+    if len(text1) != len(text2):
+        print("失败 重推 ------------------------>")
+        return False
+    else:
+        for i in range(len(text1)):
+            if not bool(
+                set(convert_to_pinyin(text1[i])[0]) &
+                set(convert_to_pinyin(text2[i])[0])
+            ):
+                print(text1[i], text2[i])
+                return False
+    return True
+
+def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language, how_to_cut=i18n("不切"), top_k=20, top_p=0.6, temperature=0.6, ref_free = False, infer_check = False):
     if prompt_text is None or len(prompt_text) == 0:
         ref_free = True
     t0 = ttime()
+    origin_language = prompt_language
+    origin_text_language = text_language
     prompt_language = dict_language[prompt_language]
     text_language = dict_language[text_language]
     if not ref_free:
@@ -323,7 +382,6 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
         if (prompt_text[-1] not in splits): prompt_text += "。" if prompt_language != "en" else "."
         print(i18n("实际输入的参考文本:"), prompt_text)
     text = text.strip("\n")
-    text = replace_consecutive_punctuation(text)
     if (text[0] not in splits and len(get_first(text)) < 4): text = "。" + text if text_language != "en" else "." + text
     
     print(i18n("实际输入的目标文本:"), text)
@@ -368,11 +426,20 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
         text = text.replace("\n\n", "\n")
     print(i18n("实际输入的目标文本(切句后):"), text)
     texts = text.split("\n")
-    texts = process_text(texts)
     texts = merge_short_text_in_array(texts, 5)
     audio_opt = []
+    global audio_slice
+    audio_slice = []
+    
     if not ref_free:
         phones1,bert1,norm_text1=get_phones_and_bert(prompt_text, prompt_language)
+
+    unique_id = uuid.uuid4()
+    now = datetime.now()
+    # 格式化时间为 YYYYmmddHHMMSS
+    formatted_time = now.strftime("%Y%M%d%H%m%s")
+    temp_dir = os.path.join("output", "tmp", f"{formatted_time}-{unique_id}")
+    os.makedirs(temp_dir, exist_ok=True)
 
     for text in texts:
         # 解决输入目标文本的空行导致报错的问题
@@ -380,60 +447,162 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
             continue
         if (text[-1] not in splits): text += "。" if text_language != "en" else "."
         print(i18n("实际输入的目标文本(每句):"), text)
-        phones2,bert2,norm_text2=get_phones_and_bert(text, text_language)
-        print(i18n("前端处理后的文本(每句):"), norm_text2)
-        if not ref_free:
-            bert = torch.cat([bert1, bert2], 1)
-            all_phoneme_ids = torch.LongTensor(phones1+phones2).to(device).unsqueeze(0)
-        else:
-            bert = bert2
-            all_phoneme_ids = torch.LongTensor(phones2).to(device).unsqueeze(0)
-
-        bert = bert.to(device).unsqueeze(0)
-        all_phoneme_len = torch.tensor([all_phoneme_ids.shape[-1]]).to(device)
-        prompt = prompt_semantic.unsqueeze(0).to(device)
-        t2 = ttime()
-        with torch.no_grad():
-            # pred_semantic = t2s_model.model.infer(
-            pred_semantic, idx = t2s_model.model.infer_panel(
-                all_phoneme_ids,
-                all_phoneme_len,
-                None if ref_free else prompt,
-                bert,
-                # prompt_phone_len=ph_offset,
-                top_k=top_k,
-                top_p=top_p,
-                temperature=temperature,
-                early_stop_num=hz * max_sec,
-            )
-        t3 = ttime()
-        # print(pred_semantic.shape,idx)
-        pred_semantic = pred_semantic[:, -idx:].unsqueeze(
-            0
-        )  # .unsqueeze(0)#mq要多unsqueeze一次
-        refer = get_spepc(hps, ref_wav_path)  # .to(device)
-        if is_half == True:
-            refer = refer.half().to(device)
-        else:
-            refer = refer.to(device)
+        
         # audio = vq_model.decode(pred_semantic, all_phoneme_ids, refer).detach().cpu().numpy()[0, 0]
-        audio = (
-            vq_model.decode(
-                pred_semantic, torch.LongTensor(phones2).to(device).unsqueeze(0), refer
+        
+        def _infer():
+            phones2,bert2,norm_text2=get_phones_and_bert(text, text_language)
+            print(i18n("前端处理后的文本(每句):"), norm_text2)
+            if not ref_free:
+                bert = torch.cat([bert1, bert2], 1)
+                all_phoneme_ids = torch.LongTensor(phones1+phones2).to(device).unsqueeze(0)
+            else:
+                bert = bert2
+                all_phoneme_ids = torch.LongTensor(phones2).to(device).unsqueeze(0)
+
+            bert = bert.to(device).unsqueeze(0)
+            all_phoneme_len = torch.tensor([all_phoneme_ids.shape[-1]]).to(device)
+            prompt = prompt_semantic.unsqueeze(0).to(device)
+            t2 = ttime()
+            with torch.no_grad():
+                # pred_semantic = t2s_model.model.infer(
+                # t2s_model 切换model重试
+                pred_semantic, idx = t2s_model.model.infer_panel(
+                    all_phoneme_ids,
+                    all_phoneme_len,
+                    None if ref_free else prompt,
+                    bert,
+                    # prompt_phone_len=ph_offset,
+                    top_k=top_k,
+                    top_p=top_p,
+                    temperature=temperature,
+                    early_stop_num=hz * max_sec,
+                )
+            t3 = ttime()
+            # print(pred_semantic.shape,idx)
+            pred_semantic = pred_semantic[:, -idx:].unsqueeze(
+                0
+            )  # .unsqueeze(0)#mq要多unsqueeze一次
+            refer = get_spepc(hps, ref_wav_path)  # .to(device)
+            if is_half == True:
+                refer = refer.half().to(device)
+            else:
+                refer = refer.to(device)
+            
+            audio = (
+                vq_model.decode(
+                    pred_semantic, torch.LongTensor(phones2).to(device).unsqueeze(0), refer
+                )
+                    .detach()
+                    .cpu()
+                    .numpy()[0, 0]
+            )  ###试试重建不带上prompt部分
+            max_audio=np.abs(audio).max()#简单防止16bit爆音
+            if max_audio>1:audio/=max_audio
+            
+        
+            temp_audio_path = os.path.join(temp_dir, f"{len(audio_slice)}.wav")
+            soundfile.write(
+                temp_audio_path,
+                (audio * 32768).astype(np.int16),
+                hps.data.sampling_rate,
             )
-                .detach()
-                .cpu()
-                .numpy()[0, 0]
-        )  ###试试重建不带上prompt部分
-        max_audio=np.abs(audio).max()#简单防止16bit爆音
-        if max_audio>1:audio/=max_audio
+            
+            infer_text = funasr_asr.only_asr(temp_audio_path)
+            print("反推文本 ======> ", infer_text)
+            
+            rm_infer_text = remove_special_characters(infer_text) 
+            rm_text = remove_special_characters(norm_text2) 
+            print("rm_infer_text", rm_infer_text)
+            print("rm_text", rm_text)
+            processed = check_text(rm_infer_text, rm_text)
+            return processed, audio
+        
+        ok = False
+        infer_count = 0
+        while not ok:
+            ok, audio = _infer()
+            if not infer_check:
+                break
+            if infer_count == 10:
+                print('--重试超过10次')
+                text = remove_special_characters(text)
+            
+            infer_count = infer_count + 1
+            if infer_count > 30:
+                raise "推理失败"
+        
+            
         audio_opt.append(audio)
+        audio_slice.append({
+            "audio": (audio * 32768).astype(np.int16),
+            "ref_wav_path": ref_wav_path, 
+            "prompt_text": prompt_text, 
+            "prompt_language": origin_language, 
+            "text": text, 
+            "text_language": origin_text_language, 
+            "top_k": top_k, 
+            "top_p": top_p, 
+            "temperature": temperature, 
+            "ref_free": ref_free,
+        })
+        
+                
         audio_opt.append(zero_wav)
         t4 = ttime()
-    print("%.3f\t%.3f\t%.3f\t%.3f" % (t1 - t0, t2 - t1, t3 - t2, t4 - t3))
+    # print("%.3f\t%.3f\t%.3f\t%.3f" % (t1 - t0, t2 - t1, t3 - t2, t4 - t3))
+    global sampling_rate 
+    sampling_rate = hps.data.sampling_rate
     yield hps.data.sampling_rate, (np.concatenate(audio_opt, 0) * 32768).astype(
         np.int16
     )
+
+zero_wav = np.zeros(
+    int(hps.data.sampling_rate * 0.3),
+    dtype=np.float16 if is_half == True else np.float32,
+)
+
+def show_slice_audio():
+    res = [None] * 100
+    for i in range(len( audio_slice)):
+        res[i] = sampling_rate,audio_slice[i]["audio"]
+    
+    return res
+
+def refresh_slice(num):
+    global audio_slice
+    audio_slice_bk = audio_slice
+    for o in get_tts_wav(
+        ref_wav_path = audio_slice[num]["ref_wav_path"],
+        prompt_text = audio_slice[num]["prompt_text"], 
+        prompt_language = audio_slice[num]["prompt_language"], 
+        text = audio_slice[num]["text"], 
+        text_language = audio_slice[num]["text_language"], 
+        top_k = audio_slice[num]["top_k"], 
+        top_p = audio_slice[num]["top_p"], 
+        temperature = audio_slice[num]["temperature"], 
+        ref_free = audio_slice[num]["ref_free"],
+        infer_check = False
+    ):
+        sampling_rate, audio = o
+    print(num, "/", len(audio_slice_bk))
+    print()
+    print("---------")
+    print(audio_slice_bk[num])
+    
+    audio_slice_bk[num]["audio"] = audio
+    audio_slice = audio_slice_bk
+    return  sampling_rate, audio
+
+def concat_slice():
+    res = []
+    for a in audio_slice:
+
+        res.append(a["audio"])
+        res.append(zero_wav)
+    
+    return sampling_rate, np.concatenate(res, 0)
+
 
 
 def split(todo_text):
@@ -466,7 +635,6 @@ def cut1(inp):
             opts.append("".join(inps[split_idx[idx]: split_idx[idx + 1]]))
     else:
         opts = [inp]
-    opts = [item for item in opts if not set(item).issubset(punctuation)]
     return "\n".join(opts)
 
 
@@ -491,21 +659,17 @@ def cut2(inp):
     if len(opts) > 1 and len(opts[-1]) < 50:  ##如果最后一个太短了，和前一个合一起
         opts[-2] = opts[-2] + opts[-1]
         opts = opts[:-1]
-    opts = [item for item in opts if not set(item).issubset(punctuation)]
     return "\n".join(opts)
 
 
 def cut3(inp):
     inp = inp.strip("\n")
-    opts = ["%s" % item for item in inp.strip("。").split("。")]
-    opts = [item for item in opts if not set(item).issubset(punctuation)]
-    return  "\n".join(opts)
+    return "\n".join(["%s" % item for item in inp.strip("。").split("。")])
+
 
 def cut4(inp):
     inp = inp.strip("\n")
-    opts = ["%s" % item for item in inp.strip(".").split(".")]
-    opts = [item for item in opts if not set(item).issubset(punctuation)]
-    return "\n".join(opts)
+    return "\n".join(["%s" % item for item in inp.strip(".").split(".")])
 
 
 # contributed by https://github.com/AI-Hobbyist/GPT-SoVITS/blob/main/GPT_SoVITS/inference_webui.py
@@ -519,8 +683,8 @@ def cut5(inp):
     # 在句子不存在符号或句尾无符号的时候保证文本完整
     if len(items)%2 == 1:
         mergeitems.append(items[-1])
-    opt = [item for item in mergeitems if not set(item).issubset(punctuation)]
-    return "\n".join(opt)
+    opt = "\n".join(mergeitems)
+    return opt
 
 
 def custom_sort_key(s):
@@ -529,24 +693,6 @@ def custom_sort_key(s):
     # 将数字部分转换为整数，非数字部分保持不变
     parts = [int(part) if part.isdigit() else part for part in parts]
     return parts
-
-def process_text(texts):
-    _text=[]
-    if all(text in [None, " ", "\n",""] for text in texts):
-        raise ValueError(i18n("请输入有效文本"))
-    for text in texts:
-        if text in  [None, " ", ""]:
-            pass
-        else:
-            _text.append(text)
-    return _text
-
-
-def replace_consecutive_punctuation(text):
-    punctuations = ''.join(re.escape(p) for p in punctuation)
-    pattern = f'([{punctuations}])([{punctuations}])+'
-    result = re.sub(pattern, r'\1', text)
-    return result
 
 
 def change_choices():
@@ -597,6 +743,7 @@ with gr.Blocks(title="GPT-SoVITS WebUI") as app:
             prompt_language = gr.Dropdown(
                 label=i18n("参考音频的语种"), choices=[i18n("中文"), i18n("英文"), i18n("日文"), i18n("中英混合"), i18n("日英混合"), i18n("多语种混合")], value=i18n("中文")
             )
+            infer_check = gr.Checkbox(label=i18n("自校验，启用将提升音频准确度但会增加耗时，有概率无法成功，合成文本必须为中文"), value=False, interactive=True, show_label=True)
         gr.Markdown(value=i18n("*请填写需要合成的目标文本和语种模式"))
         with gr.Row():
             text = gr.Textbox(label=i18n("需要合成的文本"), value="")
@@ -614,13 +761,43 @@ with gr.Blocks(title="GPT-SoVITS WebUI") as app:
                 top_k = gr.Slider(minimum=1,maximum=100,step=1,label=i18n("top_k"),value=5,interactive=True)
                 top_p = gr.Slider(minimum=0,maximum=1,step=0.05,label=i18n("top_p"),value=1,interactive=True)
                 temperature = gr.Slider(minimum=0,maximum=1,step=0.05,label=i18n("temperature"),value=1,interactive=True)
-            inference_button = gr.Button(i18n("合成语音"), variant="primary")
+            
+            with gr.Row():
+
+                inference_button = gr.Button(i18n("合成语音"), variant="primary")
+            
+
+        with gr.Row():
             output = gr.Audio(label=i18n("输出的语音"))
+        with gr.Row():
+            inference_slice_button = gr.Button(i18n("查看语音片段"), variant="primary")
+        with gr.Row():
+
+            def render_components():  
+                for i in range(100):  
+                    with gr.Row():  
+                        audios.append(gen_audio(i))
+                        btns.append(gen_btn(i))
+
+            render_components()
+        with gr.Row():
+            concat_btn = gr.Button("合并")
+        
+        concat_btn.click(concat_slice,
+            outputs=[output]     
+        )
 
         inference_button.click(
             get_tts_wav,
-            [inp_ref, prompt_text, prompt_language, text, text_language, how_to_cut, top_k, top_p, temperature, ref_text_free],
+            [inp_ref, prompt_text, prompt_language, text, text_language, how_to_cut, top_k, top_p, temperature, ref_text_free, infer_check],
             [output],
+        )
+
+        inference_slice_button.click(
+            show_slice_audio,
+            [],
+            # [slice1, slice2],
+            outputs=audios
         )
 
         gr.Markdown(value=i18n("文本切分工具。太长的文本合成出来效果不一定好，所以太长建议先切。合成会根据文本的换行分开合成再拼起来。"))
