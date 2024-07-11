@@ -22,21 +22,6 @@ import soundfile
 from datetime import datetime
 import uuid
 from pypinyin import pinyin, Style
-# import whisper
-# model = whisper.load_model("medium")  
-# import librosa
-# y, sr = librosa.load('output/slice_opt/chenxiaobing_long7min/long7min.wav_0000012800_0000148800.wav', sr=None)
-
-# t = funasr_asr.only_asr("/workspace/output/slice_opt/chenxiaobing_long7min/long7min.wav_0000012800_0000148800.wav'")
-# print('--')
-
-# print('t', t)
-
-# raise
-
-
-
-
 
 if os.path.exists("./gweight.txt"):
     with open("./gweight.txt", 'r', encoding="utf-8") as file:
